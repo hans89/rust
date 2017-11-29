@@ -38,10 +38,25 @@ pub enum PopResult<T> {
     /// The queue is in an inconsistent state. Popping data should succeed, but
     /// some pushers have yet to make enough progress in order allow a pop to
     /// succeed. It is recommended that a pop() occur "in the near future" in
-    /// order to see if the sender has made progress or not
+    /// order to see if the sender has made progress or not.
+    ///
+    /// HD: the word "inconsistent" comes with the phrase "window of inconsistency",
+    /// which is the case in which, for the consumer, head and tail of the queue are
+    /// still the same (ie. the queue is empty), but the next field of tail is not null.
+    /// This is the exact moment when the producer has already put the new element
+    /// in the linked list, but has not set head to point to this new element (or it
+    /// already has, but the change has not reach the consumer yet). This is in between
+    /// the queue's transition from the empty state to a non-empty state (the window).
+    /// The queue technically is non-empty, but the push has not finished yet, so it is
+    /// logically empty.
     Inconsistent,
 }
 
+/// HD: Node structure of the MPSC queue
+/// This queue supports pushing to the head, and poping from the tail of the queue
+/// The next field is from the perspective of the consumer: the consumer will pop
+/// the next node from the tail. The links are in the direction from tail to head.
+/// The tail node is always a sentinel node.
 struct Node<T> {
     next: AtomicPtr<Node<T>>,
     value: Option<T>,
@@ -50,12 +65,17 @@ struct Node<T> {
 /// The multi-producer single-consumer structure. This is not cloneable, but it
 /// may be safely shared so long as it is guaranteed that there is only one
 /// popper at a time (many pushers are allowed).
+///
+/// HD: The head is shared atomically among producers and the consumer, while the tail is
+/// is owned uniquely and non-atomically by the consumer.
 pub struct Queue<T> {
     head: AtomicPtr<Node<T>>,
     tail: UnsafeCell<*mut Node<T>>,
 }
 
 unsafe impl<T: Send> Send for Queue<T> { }
+/// HD: the queue is not sync for multiple consumers.
+/// TODO: This unsafety is currently not reflected.
 unsafe impl<T: Send> Sync for Queue<T> { }
 
 impl<T> Node<T> {
@@ -70,6 +90,9 @@ impl<T> Node<T> {
 impl<T> Queue<T> {
     /// Creates a new queue that is safe to share among multiple producers and
     /// one consumer.
+    ///
+    /// HD: Initialization creates a sentinel node. There is always one sentinel node, which
+    /// the tail always points to.
     pub fn new() -> Queue<T> {
         let stub = unsafe { Node::new(None) };
         Queue {
@@ -79,6 +102,12 @@ impl<T> Queue<T> {
     }
 
     /// Pushes a new value onto this queue.
+    ///
+    /// HD: Pushes replace head with the new node, before setting the old head's link
+    /// to this new node. In between these two actions is the window of inconsistency.
+    /// The swap is AcqRel, to sync with other swaps from other producers.
+    /// The link's store is Rel, to sync with the consumer's Acq load. This Rel store releases
+    /// the permission to acquire the node.
     pub fn push(&self, t: T) {
         unsafe {
             let n = Node::new(Some(t));
@@ -97,6 +126,14 @@ impl<T> Queue<T> {
     ///
     /// This inconsistent state means that this queue does indeed have data, but
     /// it does not currently have access to it at this time.
+    ///
+    /// HD: the Acq load of the next element from tail is sync-ing with the Rel store of push.
+    /// If the load of this next field is non-null, the load acquires the permission to use
+    /// the node.
+    /// If the tail's link (the next) is null, the queue is logically empty (subjectively for
+    /// the consumer). In this case, if head == tail then, subjective for the consumer, the queue
+    /// is really empty. Otherwise it is in the window of inconsistency.
+    /// The Acq load of head is unnecessary, and can be replaced with Relaxed. TODO: proof.
     pub fn pop(&self) -> PopResult<T> {
         unsafe {
             let tail = *self.tail.get();
@@ -116,6 +153,14 @@ impl<T> Queue<T> {
     }
 }
 
+/// HD: dropping starts from tail, utilizing Box's drop. This means that only the tail's owner
+/// should call drop: the tail transitively owns the queue. However, the code does not make it
+/// clear when one should call drop, and the Relaxed load does not guarantess the absence of
+/// memory leaks. In fact, while it is completely safe to drop while there are concurrent pushes,
+/// the updates from the pushes do not necessarily reach the dropping thread in time, making
+/// cur.is_null return true and the loop break, thus leaking memory. Making the load Acq does not
+/// help either. To avoid memory leaks, the last pushes of the producers must be sync-ed to the
+/// thread before the thread calls drop.
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
         unsafe {
