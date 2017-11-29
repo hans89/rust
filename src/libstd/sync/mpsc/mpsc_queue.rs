@@ -155,7 +155,8 @@ impl<T> Queue<T> {
 
 /// HD: dropping starts from tail, utilizing Box's drop.
 /// The &mut reference ensures that the dropping thread owns the queue completely, thus has
-/// observed all the changes to the queue.
+/// observed all the changes to the queue. For example, see the test below: this sync is ensured
+/// by Arc.
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
         unsafe {

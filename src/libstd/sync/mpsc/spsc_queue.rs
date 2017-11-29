@@ -24,7 +24,11 @@ use sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use super::cache_aligned::CacheAligned;
 
-// Node within the linked list queue of messages to send
+/// Node within the linked list queue of messages to send
+///
+/// HD: This queue support pushing to the head, and poping from the tail.
+/// "next" is from the perspective of the tail. These links are in the direction
+/// from tail to head.
 struct Node<T> {
     // FIXME: this could be an uninitialized T if we're careful enough, and
     //      that would reduce memory usage (and be a bit faster).
@@ -38,6 +42,12 @@ struct Node<T> {
 /// but it can be safely shared in an Arc if it is guaranteed that there
 /// is only one popper and one pusher touching the queue at any one point in
 /// time.
+///
+/// HD: addtions are data that the user might want to attach to the queue. These
+/// additions will use the padding bytes of the producer and the consumer.
+/// See with_additions for more about the padding, which has to do with cache
+/// alignment. The user should be aware that the additions share the same cache line
+/// with the producer/consumer.
 pub struct Queue<T, ProducerAddition=(), ConsumerAddition=()> {
     // consumer fields
     consumer: CacheAligned<Consumer<T, ConsumerAddition>>,
@@ -46,6 +56,9 @@ pub struct Queue<T, ProducerAddition=(), ConsumerAddition=()> {
     producer: CacheAligned<Producer<T, ProducerAddition>>,
 }
 
+/// HD: Consumer data
+/// tail is owned uniquely and non-atomicly by the consumer, while tail_prev
+/// (always points to a node before that of tail) is shared with the producer.
 struct Consumer<T, Addition> {
     tail: UnsafeCell<*mut Node<T>>, // where to pop from
     tail_prev: AtomicPtr<Node<T>>, // where to pop from
@@ -54,6 +67,17 @@ struct Consumer<T, Addition> {
     addition: Addition,
 }
 
+/// HD: Producer data, all uniquely non-atomic pointers
+/// head points to the head of the queue, while first points to the head of the node cache.
+/// The actual useable cache for the producer is between tail_copy and first.
+/// The potential cache is between tail and tail_copy (excluding tail but including tail_prev).
+/// A digram depicts this structure:
+/// | -current-content- |    | -cache-able- | -cached- |
+/// head                tail tail_prev      tail_copy  first
+///
+/// Cached marking for a node only has a meaning for bounded cache.
+/// If cache_bound is 0 (ie. unbounded cache), then a node's cached field is ignored.
+/// If the cache is bounded, then TODO: explain
 struct Producer<T, Addition> {
     head: UnsafeCell<*mut Node<T>>,      // where to push to
     first: UnsafeCell<*mut Node<T>>,     // where to get new nodes from
@@ -103,6 +127,10 @@ impl<T, ProducerAddition, ConsumerAddition> Queue<T, ProducerAddition, ConsumerA
     ///               cache (if desired). If the value is 0, then the cache has
     ///               no bound. Otherwise, the cache will never grow larger than
     ///               `bound` (although the queue itself could be much larger.
+    ///
+    /// HD: there are 2 sentinels. n2 is the sentinel for the queue content: head and tail
+    /// start with n2. n1 is the sentinel for the queue cache: tail_prev, tail and first
+    /// start with n1. n1 nexts to n2.
     pub unsafe fn with_additions(
         bound: usize,
         producer_addition: ProducerAddition,
@@ -130,6 +158,9 @@ impl<T, ProducerAddition, ConsumerAddition> Queue<T, ProducerAddition, ConsumerA
 
     /// Pushes a new value onto this queue. Note that to use this function
     /// safely, it must be externally guaranteed that there is only one pusher.
+    ///
+    /// HD: in a semantics that supports mixing non-atomic and atomic accesses,
+    /// it should be possible to write non-atomically to (*n).next here.
     pub fn push(&self, t: T) {
         unsafe {
             // Acquire a node (which either uses a cached one or allocates a new
@@ -143,6 +174,8 @@ impl<T, ProducerAddition, ConsumerAddition> Queue<T, ProducerAddition, ConsumerA
         }
     }
 
+    /// HD: in a semantics that supports mixing non-atomic and atomic accesses,
+    /// it should be possible to read (*ret).next non-atomically here.
     unsafe fn alloc(&self) -> *mut Node<T> {
         // First try to see if we can consume the 'first' node for our uses.
         if *self.producer.first.get() != *self.producer.tail_copy.get() {
@@ -180,6 +213,9 @@ impl<T, ProducerAddition, ConsumerAddition> Queue<T, ProducerAddition, ConsumerA
 
             *self.consumer.0.tail.get() = next;
             if self.consumer.cache_bound == 0 {
+                /// HD: Adding the old tail to the cache, by updating tail_prev to this old tail.
+                /// Recall that the actual cache is from first to tail_prev (inclusive).
+                /// If the cache is unbounded, then the cached field is ignored.
                 self.consumer.tail_prev.store(tail, Ordering::Release);
             } else {
                 let cached_nodes = self.consumer.cached_nodes.load(Ordering::Relaxed);
