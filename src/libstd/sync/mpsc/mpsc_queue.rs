@@ -75,7 +75,7 @@ pub struct Queue<T> {
 
 unsafe impl<T: Send> Send for Queue<T> { }
 /// HD: the queue is not sync for multiple consumers.
-/// TODO: This unsafety is currently not reflected.
+/// TODO: This unsafety is currently not reflected. This is an unsafe interface.
 unsafe impl<T: Send> Sync for Queue<T> { }
 
 impl<T> Node<T> {
@@ -153,14 +153,9 @@ impl<T> Queue<T> {
     }
 }
 
-/// HD: dropping starts from tail, utilizing Box's drop. This means that only the tail's owner
-/// should call drop: the tail transitively owns the queue. However, the code does not make it
-/// clear when one should call drop, and the Relaxed load does not guarantess the absence of
-/// memory leaks. In fact, while it is completely safe to drop while there are concurrent pushes,
-/// the updates from the pushes do not necessarily reach the dropping thread in time, making
-/// cur.is_null return true and the loop break, thus leaking memory. Making the load Acq does not
-/// help either. To avoid memory leaks, the last pushes of the producers must be sync-ed to the
-/// thread before the thread calls drop.
+/// HD: dropping starts from tail, utilizing Box's drop.
+/// The &mut reference ensures that the dropping thread owns the queue completely, thus has
+/// observed all the changes to the queue.
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
         unsafe {
